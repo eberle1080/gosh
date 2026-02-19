@@ -1,7 +1,7 @@
 package runner
 
 import (
-	"fmt"
+	"errors"
 	"strings"
 )
 
@@ -23,7 +23,7 @@ func (c *Command) Err() error {
 	if len(c.Error) == 0 {
 		return nil
 	}
-	return fmt.Errorf(strings.Join(c.Error, "\n"))
+	return errors.New(strings.Join(c.Error, "\n"))
 }
 
 // NewCommand creates a new command
@@ -39,7 +39,7 @@ func NewCommand(command string, output string, err error) *Command {
 		ret.Stdout = strings.Split(output, "\n")
 	}
 	if errStr != "" {
-		ret.Stdout = strings.Split(errStr, "\n")
+		ret.Error = strings.Split(errStr, "\n")
 	}
 	return ret
 }

@@ -2,6 +2,8 @@ package runner
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"context"
 	"fmt"
 	"io"
@@ -20,6 +22,7 @@ const (
 	// Slightly higher drain timeout to reduce flakiness when residual output
 	// appears just after issuing a new command.
 	drainTimeoutMs = 100
+	statusMarkerPrefix = "__gosh_status__:"
 )
 
 type (
@@ -35,13 +38,15 @@ type (
 		error      chan string
 		options    *Options
 		done       chan bool
+		marker     string
+		commandSeq uint64
 	}
 )
 
 // FormatCmd formats a command that is sent to an interactive shell via stdin.
 //
 // Key guarantees:
-//   - Always append a "status:" marker so the runner can detect completion and
+//   - Always append a unique status marker so the runner can detect completion and
 //     capture the exit code.
 //   - Shield the shell's stdin from the user command by grouping and redirecting
 //     that group's stdin to /dev/null. This prevents commands that read from
@@ -55,26 +60,27 @@ type (
 // Final layout:
 //
 //	{ set -o pipefail 2>/dev/null; <user_command>; } </dev/null
-//	status=$?; echo 'status:'$status
+//	status=$?; echo '__gosh_status__:<nonce>:'$status
 //
 // Using a group redirection avoids brittle parsing (quotes, pipes, heredocs)
 // and reliably shields the shell stdin across a wide range of inputs.
 func (p *Pipeline) FormatCmd(cmd string) string {
+	marker := p.nextStatusMarker()
 	shell := strings.ToLower(p.options.Shell)
 	if runtime.GOOS == "windows" || strings.Contains(shell, "cmd.exe") || strings.Contains(shell, "powershell") || strings.Contains(shell, "pwsh") {
-		return p.formatCmdWindows(cmd)
+		return p.formatCmdWindows(cmd, marker)
 	}
-	return p.formatCmdPosix(cmd)
+	return p.formatCmdPosix(cmd, marker)
 }
 
-func (p *Pipeline) formatCmdPosix(cmd string) string {
+func (p *Pipeline) formatCmdPosix(cmd string, marker string) string {
 	cmd = EnsureLineTermination(cmd)
 	body := strings.TrimSuffix(cmd, "\n")
 	grouped := "{ set -o pipefail 2>/dev/null; " + body + "; } </dev/null\n"
-	return grouped + "status=$?; echo 'status:'$status\n"
+	return grouped + "status=$?; echo '" + marker + "'$status\n"
 }
 
-func (p *Pipeline) formatCmdWindows(cmd string) string {
+func (p *Pipeline) formatCmdWindows(cmd string, marker string) string {
 	shell := strings.ToLower(p.options.Shell)
 	if strings.Contains(shell, "powershell") || strings.Contains(shell, "pwsh") {
 		// PowerShell: Use try/catch and $LASTEXITCODE for external commands
@@ -84,7 +90,7 @@ func (p *Pipeline) formatCmdWindows(cmd string) string {
 		body := strings.TrimSuffix(cmd, "\n")
 		// Redirect stdin from $null is not necessary in PowerShell; avoid complexity.
 		// Emit status from $LASTEXITCODE; best-effort for native commands.
-		return body + "; $code = $LASTEXITCODE; Write-Output \"status:$code\"\r\n"
+		return body + "; $code = $LASTEXITCODE; Write-Output \"" + marker + "$code\"\r\n"
 	}
 	// cmd.exe: group with parentheses, protect stdin with NUL, emit %ERRORLEVEL%
 	// Ensure CRLF to be friendly with cmd.exe
@@ -93,7 +99,7 @@ func (p *Pipeline) formatCmdWindows(cmd string) string {
 	}
 	body := strings.TrimSuffix(cmd, "\n")
 	grouped := "(" + body + ") < NUL\r\n"
-	return grouped + "echo status:%ERRORLEVEL%\r\n"
+	return grouped + "echo " + marker + "%ERRORLEVEL%\r\n"
 }
 
 func EnsureLineTermination(cmd string) string {
@@ -235,17 +241,19 @@ func (p *Pipeline) Read(ctx context.Context, opts ...Option) (output string, has
 	var timeoutDuration = time.Duration(tickFrequencyMs) * time.Millisecond
 	out := ""
 	var statusCode *int
+	var statusScanTail string
 outer:
 	for {
 		select {
 		case partialOutput := <-p.output:
 			waitTimeMs = 0
-			if code := p.extractStatusCode(&partialOutput); code != nil {
+			if code := p.extractStatusCode(partialOutput, &statusScanTail); code != nil {
 				statusCode = code
 			}
 
 			out += partialOutput
 			if statusCode != nil {
+				out = p.stripStatusToken(out)
 				break outer
 			}
 
@@ -259,7 +267,7 @@ outer:
 			if hasTerminator || len(partialOutput) == 0 {
 				break outer
 			}
-			if code := p.extractStatusCode(&out); code != nil {
+			if code := p.extractStatusCode(out, &statusScanTail); code != nil {
 				statusCode = code
 			}
 			if (hasTerminator || statusCode != nil) && len(p.output) == 0 {
@@ -268,7 +276,7 @@ outer:
 		case e := <-p.error:
 			errOut += e
 			window.notify(p.removePromptIfNeeded(e))
-			if code := p.extractStatusCode(&out); code != nil {
+			if code := p.extractStatusCode(out, &statusScanTail); code != nil {
 				statusCode = code
 			}
 			if (hasTerminator || statusCode != nil) && len(p.error) == 0 {
@@ -291,6 +299,7 @@ outer:
 	if errOut != "" {
 		out += errOut
 	}
+	out = p.stripStatusToken(out)
 
 	if len(out) > 0 {
 		hasOutput = true
@@ -302,33 +311,99 @@ outer:
 	return out, hasOutput, *statusCode, err
 }
 
-var zeroPos = 0
-
-func (p *Pipeline) extractStatusCode(out *string) *int {
-	if index := strings.LastIndex(*out, "\n"); index != -1 {
-		var candidate string
-		var update *int
-		if prevIndex := strings.LastIndex((*out)[:index], "\n"); prevIndex != -1 {
-			candidate = strings.TrimSpace(term.Clean((*out)[prevIndex:index]))
-			index = prevIndex
-			update = &index
-
-		} else {
-			candidate = strings.TrimSpace(term.Clean((*out)[:index]))
-			update = &zeroPos
-		}
-		candidate = p.removePromptIfNeeded(candidate)
-		if !strings.HasPrefix(candidate, "status:") {
-			return nil
-		}
-		candidate = candidate[7:]
-		code, err := strconv.Atoi(candidate)
-		if err == nil {
-			*out = (*out)[:*update]
-			return &code
+func (p *Pipeline) extractStatusCode(chunk string, tail *string) *int {
+	marker := p.statusMarker()
+	if marker == "" {
+		return nil
+	}
+	buffer := *tail + chunk
+	markerPos := strings.LastIndex(buffer, marker)
+	if markerPos == -1 {
+		*tail = keepTail(buffer, len(marker)+32)
+		return nil
+	}
+	start := markerPos + len(marker)
+	end := start
+	for ; end < len(buffer); end++ {
+		if buffer[end] < '0' || buffer[end] > '9' {
+			break
 		}
 	}
-	return nil
+	if end == start {
+		*tail = buffer[markerPos:]
+		return nil
+	}
+	code, err := strconv.Atoi(buffer[start:end])
+	if err != nil {
+		*tail = buffer[markerPos:]
+		return nil
+	}
+	*tail = ""
+	return &code
+}
+
+func (p *Pipeline) statusMarker() string {
+	p.mux.Lock()
+	defer p.mux.Unlock()
+	return p.marker
+}
+
+func (p *Pipeline) setStatusMarker(marker string) {
+	p.mux.Lock()
+	defer p.mux.Unlock()
+	p.marker = marker
+}
+
+func (p *Pipeline) nextStatusMarker() string {
+	token := randomToken(8)
+	seq := atomic.AddUint64(&p.commandSeq, 1)
+	marker := statusMarkerPrefix + strconv.FormatUint(seq, 10) + "_" + token + ":"
+	p.setStatusMarker(marker)
+	return marker
+}
+
+func randomToken(size int) string {
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(buf)
+}
+
+func keepTail(input string, max int) string {
+	if len(input) <= max {
+		return input
+	}
+	return input[len(input)-max:]
+}
+
+func (p *Pipeline) stripStatusToken(output string) string {
+	marker := p.statusMarker()
+	if marker == "" {
+		return output
+	}
+	markerPos := strings.LastIndex(output, marker)
+	if markerPos == -1 {
+		return output
+	}
+	start := markerPos + len(marker)
+	end := start
+	for ; end < len(output); end++ {
+		if output[end] < '0' || output[end] > '9' {
+			break
+		}
+	}
+	if end == start {
+		return output
+	}
+	// Trim optional line ending directly after status code.
+	if end < len(output) && output[end] == '\r' {
+		end++
+	}
+	if end < len(output) && output[end] == '\n' {
+		end++
+	}
+	return output[:markerPos] + output[end:]
 }
 
 func (p *Pipeline) hasPrompt(input string) bool {

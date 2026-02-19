@@ -31,7 +31,7 @@ func TestService_Run(t *testing.T) {
 	assert.True(t, len(output) > 0)
 }
 
-func ExampleLocalRun() {
+func Example_localRun() {
 	srv, err := gosh.New(context.Background(), local.New())
 	if err != nil {
 		return
@@ -41,14 +41,14 @@ func ExampleLocalRun() {
 	println(output)
 }
 
-func ExampleRemoveRun() {
+func Example_remoteRun() {
 	host := "localhost"
 	privateKeyBytes := getKeyLocation(host)
 	if privateKeyBytes == nil {
 		return
 	}
 	sshCred := cred.SSH{
-		PrivateKey: privateKeyBytes,
+		PrivateKeyPayload: privateKeyBytes,
 		Basic: cred.Basic{
 			Username: os.Getenv("USER"),
 		},
