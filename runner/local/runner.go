@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -19,6 +20,7 @@ type Runner struct {
 	pipeline *runner.Pipeline
 	stdin    io.WriteCloser
 	counter  int32
+	runMu    sync.Mutex
 }
 
 // Send sends data to stdin
@@ -41,6 +43,9 @@ func (r *Runner) ensureCommandStarted() {
 
 // Run runs supplied command
 func (r *Runner) Run(ctx context.Context, command string, options ...runner.Option) (string, int, error) {
+	// Serialize command execution on a shared interactive shell session.
+	r.runMu.Lock()
+	defer r.runMu.Unlock()
 
 	if err := r.initIfNeeded(ctx); err != nil {
 		return "", 0, err

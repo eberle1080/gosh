@@ -2,12 +2,15 @@ package local
 
 import (
 	"context"
-	"os/exec"
-	"runtime"
-	"strings"
+	"fmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/viant/gosh/runner"
+	"os/exec"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -40,4 +43,47 @@ func TestService_Run_PipelineWithRqEmptyResult(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, code)
 	assert.Equal(t, "0", strings.TrimSpace(output))
+}
+
+func TestService_Run_ConcurrentCallsSerialized(t *testing.T) {
+	r := New()
+	defer func() { _ = r.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	const workers = 8
+	var wg sync.WaitGroup
+	wg.Add(workers)
+
+	errCh := make(chan error, workers)
+	outCh := make(chan string, workers)
+	for i := 0; i < workers; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			out, code, err := r.Run(ctx, "echo worker-"+strconv.Itoa(i), runner.WithTimeout(3000))
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if code != 0 {
+				errCh <- fmt.Errorf("unexpected exit code: %d", code)
+				return
+			}
+			outCh <- strings.TrimSpace(out)
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	close(outCh)
+
+	for err := range errCh {
+		require.NoError(t, err)
+	}
+	seen := map[string]bool{}
+	for out := range outCh {
+		seen[out] = true
+	}
+	assert.Equal(t, workers, len(seen))
 }

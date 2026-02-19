@@ -8,6 +8,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -24,6 +25,7 @@ type Runner struct {
 	stdin    io.WriteCloser
 	pid      int
 	counter  int32
+	runMu    sync.Mutex
 }
 
 // Send returns stdin writer
@@ -96,16 +98,16 @@ func (r *Runner) start(ctx context.Context) (err error) {
 		return err
 	}
 	var pid string
-	pid, _, err = r.Run(ctx, "echo $$")
+	pid, _, err = r.runBootstrap(ctx, "echo $$")
 	if err == nil {
 		pid = strings.TrimSpace(pid)
 		r.pid, err = strconv.Atoi(pid)
 	}
 	if r.options.Path != "" {
-		_, _, err = r.Run(ctx, "cd "+r.options.Path)
+		_, _, err = r.runBootstrap(ctx, "cd "+r.options.Path)
 	}
 	if len(r.options.SystemPaths) > 0 {
-		_, _, err = r.Run(ctx, "export PATH=$PATH:"+strings.Join(r.options.SystemPaths, ":"))
+		_, _, err = r.runBootstrap(ctx, "export PATH=$PATH:"+strings.Join(r.options.SystemPaths, ":"))
 	}
 
 	return err
@@ -132,6 +134,10 @@ func (r *Runner) init(ctx context.Context) (err error) {
 
 // Run runs supplied command
 func (r *Runner) Run(ctx context.Context, command string, options ...runner.Option) (string, int, error) {
+	// Serialize command execution on a shared interactive shell session.
+	r.runMu.Lock()
+	defer r.runMu.Unlock()
+
 	if err := r.initIfNeeded(ctx); err != nil {
 		return "", 0, err
 	}
@@ -184,6 +190,15 @@ func (r *Runner) initIfNeeded(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (r *Runner) runBootstrap(ctx context.Context, command string) (string, int, error) {
+	if err := r.runCommand(command); err != nil {
+		return "", 0, err
+	}
+	atomic.AddInt32(&r.counter, 1)
+	output, _, code, err := r.pipeline.Read(ctx)
+	return output, code, err
 }
 
 // New creates a new runner

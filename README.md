@@ -7,6 +7,7 @@ Please refer to [`CHANGELOG.md`](CHANGELOG.md) if you encounter breaking changes
 
 - [Motivation](#motivation)
 - [Usage](#usage)
+- [Pipeline Completion Detection](#pipeline-completion-detection)
 - [License](#license)
 - [Credits and Acknowledgements](#credits-and-acknowledgements)
 
@@ -125,6 +126,17 @@ func ExampleMCPIntegration() error {
 }
     
 ```
+
+## Pipeline Completion Detection
+
+When `Runner.Run` executes a command, `gosh` appends an internal completion token to the command stream and parses it from shell output to determine the final exit code.
+
+- The token is unique per command (`__gosh_status__:<sequence>_<nonce>:`), which reduces collisions with user command output.
+- For POSIX shells, commands are executed in a group with `set -o pipefail 2>/dev/null` and stdin redirected from `/dev/null`:
+  - `{ set -o pipefail 2>/dev/null; <command>; } </dev/null`
+- If `pipefail` is supported, pipelines return non-zero when any stage fails.
+- If `pipefail` is not supported by the shell, exit status falls back to standard shell behavior (status of the last pipeline command).
+- The completion token is stripped from returned command output.
 
 
 ## License
