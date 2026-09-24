@@ -3,7 +3,7 @@ package ssh
 import (
 	"context"
 	"fmt"
-	"github.com/viant/gosh/runner"
+	"github.com/eberle1080/gosh/runner"
 	"golang.org/x/crypto/ssh"
 	"io"
 	"strconv"

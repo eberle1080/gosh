@@ -1,4 +1,4 @@
-module github.com/viant/gosh
+module github.com/eberle1080/gosh
 
 go 1.25.1
 

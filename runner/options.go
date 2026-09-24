@@ -1,7 +1,7 @@
 package runner
 
 import (
-	"github.com/viant/gosh/term"
+	"github.com/eberle1080/gosh/term"
 )
 
 const (
