@@ -4,7 +4,7 @@ go 1.25.1
 
 require (
 	github.com/stretchr/testify v1.10.0
-	github.com/viant/afs v1.26.2
+	github.com/viant/afs v1.30.0
 	github.com/viant/scy v0.24.0
 	golang.org/x/crypto v0.38.0
 )
