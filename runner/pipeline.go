@@ -2,9 +2,9 @@ package runner
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"context"
 	"fmt"
 	"io"
 	"runtime"
@@ -14,14 +14,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/viant/gosh/term"
+	"github.com/eberle1080/gosh/term"
 )
 
 const (
 	defaultTickFrequency = 100
 	// Slightly higher drain timeout to reduce flakiness when residual output
 	// appears just after issuing a new command.
-	drainTimeoutMs = 100
+	drainTimeoutMs     = 100
 	statusMarkerPrefix = "__gosh_status__:"
 )
 
@@ -120,9 +120,21 @@ func (p *Pipeline) Drain(ctx context.Context, opts ...Option) {
 	}
 }
 
-// Err returns error
+// Err returns the error that closed the pipeline, if any.
 func (p *Pipeline) Err() error {
+	p.mux.Lock()
+	defer p.mux.Unlock()
 	return p.err
+}
+
+// setErr records the first error that closes the pipeline. The stdout and stderr copy
+// goroutines can both fail when the process exits, so this runs concurrently.
+func (p *Pipeline) setErr(err error) {
+	p.mux.Lock()
+	defer p.mux.Unlock()
+	if p.err == nil {
+		p.err = err
+	}
 }
 
 // Running returns true if pipeline is running
@@ -193,7 +205,7 @@ func (p *Pipeline) copy(reader io.Reader, dest chan string, notification *sync.W
 }
 
 func (p *Pipeline) closeIfError(writeError error) error {
-	p.err = writeError
+	p.setErr(writeError)
 	return p.Close()
 }
 

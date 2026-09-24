@@ -3,7 +3,7 @@ package local
 import (
 	"context"
 	"fmt"
-	"github.com/viant/gosh/runner"
+	"github.com/eberle1080/gosh/runner"
 	"io"
 	"os"
 	"os/exec"

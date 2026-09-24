@@ -2,7 +2,7 @@ package gosh
 
 import (
 	"context"
-	"github.com/viant/gosh/runner"
+	"github.com/eberle1080/gosh/runner"
 	"strings"
 )
 

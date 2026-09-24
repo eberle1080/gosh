@@ -3,7 +3,7 @@ package replay
 import (
 	"context"
 	"fmt"
-	"github.com/viant/gosh/runner"
+	"github.com/eberle1080/gosh/runner"
 )
 
 // Runner represents a command runner

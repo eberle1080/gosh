@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/viant/gosh/runner"
+	"github.com/eberle1080/gosh/runner"
 	"os/exec"
 	"runtime"
 	"strconv"
