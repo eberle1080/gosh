@@ -54,14 +54,13 @@ type (
 //     that group's stdin to /dev/null. This prevents commands that read from
 //     stdin from consuming the subsequently appended status marker. Explicit
 //     stdin redirections inside the user command still take precedence.
-//   - Attempt to enable 'pipefail' (if supported) inside the group so pipelines
-//     report a non-zero status when any segment fails. On shells without
-//     pipefail, this attempt is silenced and the status falls back to that of the
-//     last command in the pipeline (standard POSIX behavior).
+//   - Probe 'pipefail' in a subshell because an unsupported option to 'set'
+//     can exit a noninteractive shell. Enable it in the command group only
+//     when supported, otherwise use the exit status of the last pipeline command.
 //
 // Final layout:
 //
-//	{ set -o pipefail 2>/dev/null; <user_command>; } </dev/null
+//	{ if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi; <user_command>; } </dev/null
 //	status=$?; echo '__gosh_status__:<nonce>:'$status
 //
 // Using a group redirection avoids brittle parsing (quotes, pipes, heredocs)
@@ -78,7 +77,7 @@ func (p *Pipeline) FormatCmd(cmd string) string {
 func (p *Pipeline) formatCmdPosix(cmd string, marker string) string {
 	cmd = EnsureLineTermination(cmd)
 	body := strings.TrimSuffix(cmd, "\n")
-	grouped := "{ set -o pipefail 2>/dev/null; " + body + "; } </dev/null\n"
+	grouped := "{ if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi; " + body + "; } </dev/null\n"
 	return grouped + "status=$?; echo '" + marker + "'$status\n"
 }
 
