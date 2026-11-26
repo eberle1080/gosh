@@ -12,12 +12,12 @@ func TestPipeline_ConcurrentErrors(t *testing.T) {
 	p := &Pipeline{}
 	first := errors.New("first")
 
-	p.setErr(first)
+	_ = p.closeIfError(first)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 50; i++ {
 		wg.Add(2)
-		go func() { defer wg.Done(); p.setErr(errors.New("later")) }()
+		go func() { defer wg.Done(); _ = p.closeIfError(errors.New("later")) }()
 		go func() { defer wg.Done(); _ = p.Err() }()
 	}
 	wg.Wait()

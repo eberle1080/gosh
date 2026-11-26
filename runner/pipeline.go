@@ -32,6 +32,7 @@ type (
 		bufferSize int
 		mux        sync.Mutex
 		running    int32
+		input      io.WriteCloser
 		stdout     io.Reader
 		stderr     io.Reader
 		output     chan string
@@ -40,6 +41,7 @@ type (
 		done       chan bool
 		marker     string
 		commandSeq uint64
+		copies     sync.WaitGroup
 	}
 )
 
@@ -52,14 +54,13 @@ type (
 //     that group's stdin to /dev/null. This prevents commands that read from
 //     stdin from consuming the subsequently appended status marker. Explicit
 //     stdin redirections inside the user command still take precedence.
-//   - Attempt to enable 'pipefail' (if supported) inside the group so pipelines
-//     report a non-zero status when any segment fails. On shells without
-//     pipefail, this attempt is silenced and the status falls back to that of the
-//     last command in the pipeline (standard POSIX behavior).
+//   - Probe 'pipefail' in a subshell because an unsupported option to 'set'
+//     can exit a noninteractive shell. Enable it in the command group only
+//     when supported, otherwise use the exit status of the last pipeline command.
 //
 // Final layout:
 //
-//	{ set -o pipefail 2>/dev/null; <user_command>; } </dev/null
+//	{ if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi; <user_command>; } </dev/null
 //	status=$?; echo '__gosh_status__:<nonce>:'$status
 //
 // Using a group redirection avoids brittle parsing (quotes, pipes, heredocs)
@@ -76,7 +77,7 @@ func (p *Pipeline) FormatCmd(cmd string) string {
 func (p *Pipeline) formatCmdPosix(cmd string, marker string) string {
 	cmd = EnsureLineTermination(cmd)
 	body := strings.TrimSuffix(cmd, "\n")
-	grouped := "{ set -o pipefail 2>/dev/null; " + body + "; } </dev/null\n"
+	grouped := "{ if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi; " + body + "; } </dev/null\n"
 	return grouped + "status=$?; echo '" + marker + "'$status\n"
 }
 
@@ -120,21 +121,11 @@ func (p *Pipeline) Drain(ctx context.Context, opts ...Option) {
 	}
 }
 
-// Err returns the error that closed the pipeline, if any.
+// Err returns error
 func (p *Pipeline) Err() error {
 	p.mux.Lock()
 	defer p.mux.Unlock()
 	return p.err
-}
-
-// setErr records the first error that closes the pipeline. The stdout and stderr copy
-// goroutines can both fail when the process exits, so this runs concurrently.
-func (p *Pipeline) setErr(err error) {
-	p.mux.Lock()
-	defer p.mux.Unlock()
-	if p.err == nil {
-		p.err = err
-	}
 }
 
 // Running returns true if pipeline is running
@@ -147,6 +138,9 @@ func (p *Pipeline) Close() (err error) {
 	if !atomic.CompareAndSwapInt32(&p.running, 1, 0) {
 		return nil
 	}
+	if p.input != nil {
+		err = p.input.Close()
+	}
 	if closer, ok := p.stdout.(io.Closer); ok {
 		err = closer.Close()
 	}
@@ -155,16 +149,20 @@ func (p *Pipeline) Close() (err error) {
 			err = e
 		}
 	}
-	p.done <- true
-	p.Drain(context.Background())
-	time.Sleep(100 * time.Millisecond)
-	close(p.output)
-	close(p.error)
+	close(p.done)
+	// Writers select on done and readers may still consume buffered output.
+	// Close result channels only after both producers have exited.
+	go func() {
+		p.copies.Wait()
+		close(p.output)
+		close(p.error)
+	}()
 
 	return err
 }
 
 func (p *Pipeline) copy(reader io.Reader, dest chan string, notification *sync.WaitGroup) error {
+	defer p.copies.Done()
 	var written int64 = 0
 	buf := make([]byte, p.options.bufferSize)
 	var err error
@@ -205,7 +203,11 @@ func (p *Pipeline) copy(reader io.Reader, dest chan string, notification *sync.W
 }
 
 func (p *Pipeline) closeIfError(writeError error) error {
-	p.setErr(writeError)
+	p.mux.Lock()
+	if p.err == nil {
+		p.err = writeError
+	}
+	p.mux.Unlock()
 	return p.Close()
 }
 
@@ -252,12 +254,27 @@ func (p *Pipeline) Read(ctx context.Context, opts ...Option) (output string, has
 	}
 	var timeoutDuration = time.Duration(tickFrequencyMs) * time.Millisecond
 	out := ""
+	outputChannel, errorChannel := p.output, p.error
+	var deadline <-chan time.Time
+	var timer *time.Timer
+	if options.strictCompletion {
+		timer = time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
+		defer timer.Stop()
+		deadline = timer.C
+	}
 	var statusCode *int
 	var statusScanTail string
 outer:
 	for {
 		select {
-		case partialOutput := <-p.output:
+		case partialOutput, open := <-outputChannel:
+			if !open {
+				outputChannel = nil
+				if errorChannel == nil {
+					break outer
+				}
+				continue
+			}
 			waitTimeMs = 0
 			if code := p.extractStatusCode(partialOutput, &statusScanTail); code != nil {
 				statusCode = code
@@ -276,34 +293,49 @@ outer:
 				}
 				window.notify(p.removePromptIfNeeded(partialOutput))
 			}
-			if hasTerminator || len(partialOutput) == 0 {
+			if !options.strictCompletion && (hasTerminator || len(partialOutput) == 0) {
 				break outer
 			}
 			if code := p.extractStatusCode(out, &statusScanTail); code != nil {
 				statusCode = code
 			}
-			if (hasTerminator || statusCode != nil) && len(p.output) == 0 {
+			if ((hasTerminator && !options.strictCompletion) || statusCode != nil) && len(p.output) == 0 {
 				break outer
 			}
-		case e := <-p.error:
+		case e, open := <-errorChannel:
+			if !open {
+				errorChannel = nil
+				if outputChannel == nil {
+					break outer
+				}
+				continue
+			}
 			errOut += e
 			window.notify(p.removePromptIfNeeded(e))
 			if code := p.extractStatusCode(out, &statusScanTail); code != nil {
 				statusCode = code
 			}
-			if (hasTerminator || statusCode != nil) && len(p.error) == 0 {
+			if ((hasTerminator && !options.strictCompletion) || statusCode != nil) && len(p.error) == 0 {
 				break outer
 			}
 			hasTerminator = p.hasTerminator(errOut, options.terminators...)
-			if (hasPrompt || hasTerminator) && len(p.error) == 0 {
+			if !options.strictCompletion && (hasPrompt || hasTerminator) && len(p.error) == 0 {
 				break outer
 			}
 		case <-ctx.Done():
+			if options.strictCompletion {
+				err = fmt.Errorf("%w: %w", ErrIncompleteCommand, ctx.Err())
+				break outer
+			}
 			return "", false, 0, fmt.Errorf("context was cancelled or timed out")
 			// Context was cancelled or timed out
+		case <-deadline:
+			err = fmt.Errorf("%w after %dms", ErrTimeout, timeoutMs)
+			break outer
 		case <-time.After(timeoutDuration):
 			waitTimeMs += tickFrequencyMs
 			if waitTimeMs >= timeoutMs {
+				err = fmt.Errorf("%w after %dms", ErrTimeout, timeoutMs)
 				break outer
 			}
 		}
@@ -316,6 +348,12 @@ outer:
 	if len(out) > 0 {
 		hasOutput = true
 		out = p.removePromptIfNeeded(out)
+	}
+	if statusCode == nil && err == nil && options.strictCompletion {
+		err = ErrIncompleteCommand
+	}
+	if statusCode == nil && err != nil {
+		return out, hasOutput, -1, err
 	}
 	if statusCode == nil {
 		statusCode = &defaultCode
@@ -341,7 +379,7 @@ func (p *Pipeline) extractStatusCode(chunk string, tail *string) *int {
 			break
 		}
 	}
-	if end == start {
+	if end == start || end == len(buffer) {
 		*tail = buffer[markerPos:]
 		return nil
 	}
@@ -440,7 +478,7 @@ func (p *Pipeline) removePromptIfNeeded(stdout string) string {
 }
 
 func (p *Pipeline) hasTerminator(input string, terminators ...string) bool {
-	if len(p.options.terminators) == 0 {
+	if len(terminators) == 0 {
 		return false
 	}
 	escapedInput := term.Clean(input)
@@ -466,6 +504,7 @@ func (p *Pipeline) hasTerminator(input string, terminators ...string) bool {
 func (p *Pipeline) init(ctx context.Context, input io.WriteCloser) error {
 	started := sync.WaitGroup{}
 	started.Add(2)
+	p.copies.Add(2)
 	go p.copy(p.stdout, p.output, &started)
 	go p.copy(p.stderr, p.error, &started)
 	started.Wait()
@@ -502,6 +541,7 @@ func NewPipeline(ctx context.Context, in io.WriteCloser, stdout io.Reader, stder
 	ret := &Pipeline{
 		running: 1,
 		options: options,
+		input:   in,
 		stdout:  stdout,
 		stderr:  stderr,
 		output:  make(chan string, 1),
@@ -509,5 +549,18 @@ func NewPipeline(ctx context.Context, in io.WriteCloser, stdout io.Reader, stder
 		done:    make(chan bool, 1),
 	}
 
-	return ret, ret.init(ctx, in)
+	if err := ret.init(ctx, in); err != nil {
+		_ = ret.Close()
+		return nil, err
+	}
+	if options.SessionContext != nil {
+		go func() {
+			select {
+			case <-options.SessionContext.Done():
+				_ = ret.Close()
+			case <-ret.done:
+			}
+		}()
+	}
+	return ret, nil
 }

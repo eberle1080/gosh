@@ -15,7 +15,8 @@ import (
 
 // Runner represents ssh runner
 type Runner struct {
-	inited   uint32
+	initOnce sync.Once
+	initErr  error
 	client   *ssh.Client
 	session  *ssh.Session
 	host     string
@@ -64,10 +65,13 @@ func (r *Runner) Close() (err error) {
 
 func (r *Runner) start(ctx context.Context) (err error) {
 	r.session, err = r.client.NewSession()
+	if err != nil {
+		return err
+	}
 	for k, v := range r.options.Env {
 		err = r.session.Setenv(k, v)
 		if err != nil {
-			return nil
+			return err
 		}
 	}
 	modes := ssh.TerminalModes{
@@ -125,7 +129,7 @@ func (r *Runner) init(ctx context.Context) (err error) {
 	}
 	defer func() {
 		if err != nil {
-			r.client.Close()
+			_ = r.Close()
 		}
 	}()
 	err = r.start(ctx)
@@ -134,6 +138,13 @@ func (r *Runner) init(ctx context.Context) (err error) {
 
 // Run runs supplied command
 func (r *Runner) Run(ctx context.Context, command string, options ...runner.Option) (string, int, error) {
+	settings := r.options.Apply(options)
+	if settings.StrictCompletion() && settings.AsPipeline() {
+		return "", -1, fmt.Errorf("strict completion is incompatible with pipeline mode")
+	}
+	if settings.SessionContext != nil && settings.SessionContext.Err() != nil {
+		return "", -1, settings.SessionContext.Err()
+	}
 	// Serialize command execution on a shared interactive shell session.
 	r.runMu.Lock()
 	defer r.runMu.Unlock()
@@ -142,6 +153,9 @@ func (r *Runner) Run(ctx context.Context, command string, options ...runner.Opti
 		return "", 0, err
 	}
 	if !r.pipeline.Running() {
+		if settings.StrictCompletion() {
+			return "", -1, fmt.Errorf("%w: shell is closed", runner.ErrIncompleteCommand)
+		}
 		return "", 0, r.pipeline.Err()
 	}
 	r.pipeline.Drain(ctx)
@@ -156,6 +170,9 @@ func (r *Runner) Run(ctx context.Context, command string, options ...runner.Opti
 		return "", 0, err
 	}
 	output, _, code, err := r.pipeline.Read(ctx, options...)
+	if err != nil && settings.StrictCompletion() {
+		_ = r.Close()
+	}
 	if r.options.History != nil {
 		r.options.History.Commands = append(r.options.History.Commands, runner.NewCommand(command, output, err))
 	}
@@ -183,13 +200,12 @@ func (r *Runner) runCommand(command string) error {
 }
 
 func (r *Runner) initIfNeeded(ctx context.Context) error {
-	if !atomic.CompareAndSwapUint32(&r.inited, 0, 1) {
-		return nil
-	}
-	if err := r.init(ctx); err != nil {
-		return err
-	}
-	return nil
+	// A failed session cannot be reused. Preserve its first initialization
+	// error for subsequent callers instead of treating it as a started shell.
+	r.initOnce.Do(func() {
+		r.initErr = r.init(ctx)
+	})
+	return r.initErr
 }
 
 func (r *Runner) runBootstrap(ctx context.Context, command string) (string, int, error) {
